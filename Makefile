@@ -5,6 +5,6 @@ PROJECT_VERSION = $(PROJECT_BUILD_TAG)
 DIALYZER_OPTS = -Wunmatched_returns
 
 DEPS = gun
-dep_gun = git https://github.com/ninenines/gun.git  2.1.0
+dep_gun = git https://github.com/erlangbureau/gun.git 0.1.0
 
 include erlang.mk

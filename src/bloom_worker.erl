@@ -6,7 +6,7 @@
 %% API Function Exports
 %% ------------------------------------------------------------------
 -export([start_link/4]).
--export([req/6]).
+-export([req/6, request/5]).
 -export([stop/2]).
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
@@ -26,6 +26,27 @@
 %% ------------------------------------------------------------------
 start_link(Opts, Id, ServiceName, Type) ->
     gen_server:start_link(?MODULE, [Id, ServiceName, Type, Opts], []).
+
+request(Uri, Method, Headers, Body, Opts) ->
+    UriMap = uri_string:parse(Uri),
+    #{path := Path} = UriMap,
+    ServiceName = make_service_name(UriMap),
+    Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
+    case bloom_pool_manager:lockout2(UriMap) of
+        {ok, Id, Connection} ->
+            call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts);
+        {error, no_free_connections} ->
+            receive
+                {ok, Id, Connection} ->
+                    call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts)
+            after Timeout ->
+                ok = bloom_stats:update_counter(ServiceName, req_total),
+                ok = bloom_stats:update_counter(ServiceName, req_failed),
+                {error, timeout_no_free_connections}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 req(ServiceName, Method, Path, Headers, Body, Opts) ->
     Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
@@ -191,3 +212,11 @@ get_stream_ref(Connection, patch, Path, Headers, Body, ReqOpts) ->
     gun:patch(Connection, Path, Headers, Body, ReqOpts);
 get_stream_ref(Connection, post, Path, Headers, Body, ReqOpts) ->
     gun:post(Connection, Path, Headers, Body, ReqOpts).
+
+make_service_name(#{scheme := Schema, host := Host} = UriMap) ->
+    Port = case Schema of
+        "http" -> 80;
+        "https" -> 443
+    end,
+    FinalPort = maps:get(port, UriMap, Port),
+    list_to_atom(Host++":"++integer_to_list(FinalPort)).

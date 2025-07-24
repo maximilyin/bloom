@@ -6,6 +6,7 @@
 -export([delete/1]).
 -export([info/0]).
 -export([req/4, req/5, req/6]).
+-export([request/4, request/5]).
 
 -type methods() :: get | post | put | patch | delete | head | options.
 
@@ -18,7 +19,7 @@
     host            => list(),
     port            => integer(),
     tls_opts        => list(),
-    keepalive       => integer(),
+    http_opts       => map(),
     connect_timeout => integer()
 }.
 
@@ -51,6 +52,27 @@ when
 delete(Name) ->
     ok = bloom_stats:delete(Name),
     bloom_sup:stop_pool(Name).
+
+-spec request(Url, Method, Headers, Opts) -> Result
+when
+    Url     :: binary(),
+    Method  :: methods(),
+    Headers :: map() | list(),
+    Opts    :: req_opts(),
+    Result  :: {ok | error, code(), headers(), body()} | {error, atom()}.
+request(Url, Method, Headers, Opts) ->
+    request(Url, Method, Headers, <<>>, Opts).
+
+-spec request(Url, Method, Headers, Body, Opts) -> Result
+when
+    Url     :: binary(),
+    Method  :: methods(),
+    Headers :: map() | list(),
+    Body    :: binary(),
+    Opts    :: req_opts(),
+    Result  :: {ok | error, code(), headers(), body()} | {error, atom()}.
+request(Url, Method, Headers, Body, Opts) ->
+    bloom_worker:request(Url, Method, Headers, Body, Opts).
 
 -spec req(ServiceName, Method, Path, Headers) -> Result
 when
