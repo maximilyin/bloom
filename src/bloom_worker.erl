@@ -215,8 +215,8 @@ get_stream_ref(Connection, post, Path, Headers, Body, ReqOpts) ->
 
 make_service_name(#{scheme := Schema, host := Host} = UriMap) ->
     Port = case Schema of
-        "http" -> 80;
-        "https" -> 443
+        <<"http">> -> 80;
+        <<"https">> -> 443
     end,
     FinalPort = maps:get(port, UriMap, Port),
-    list_to_atom(Host++":"++integer_to_list(FinalPort)).
+    binary_to_atom(<<Host/binary, ":", (integer_to_binary(FinalPort))/binary>>, utf8).

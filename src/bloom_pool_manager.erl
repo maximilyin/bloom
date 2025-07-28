@@ -33,7 +33,7 @@ start_link(Name, Opts) ->
 
 lockout2(#{host := Host} = UriMap) ->
     Port = get_port(UriMap),
-    Name = Host ++ ":" ++ integer_to_list(Port),
+    Name = <<Host/binary,":", (integer_to_binary(Port))/binary>>,
     PoolName = make_pool_name(Name),
     case is_pool_exists(PoolName) of
         true -> ok;
@@ -258,11 +258,11 @@ is_pool_exists(PoolName) ->
     lists:member(PoolName, RegisteredProcess).
 
 make_pool_name(Name) when is_atom(Name) ->
-    StringName = atom_to_list(Name),
+    StringName = atom_to_binary(Name, utf8),
     make_pool_name(StringName);
-make_pool_name(Name) when is_list(Name) ->
-    CompaundName = "bloom_"++Name++"_pool_manager",
-    list_to_atom(CompaundName).
+make_pool_name(Name) when is_binary(Name) ->
+    CompaundName = <<"bloom_", Name/binary, "_pool_manager">>,
+    binary_to_atom(CompaundName, utf8).
 
 create_pool(#{host := Host} = UriMap) ->
     Port = get_port(UriMap),
@@ -272,22 +272,22 @@ create_pool(#{host := Host} = UriMap) ->
         pool_max_size => 5
     },
     Opts = #{
-        host => Host,
+        host => binary_to_list(Host),
         port => Port,
         http_opts => #{keepalive => 10000}
     },
     ConnectionOpts = maps:merge(Opts, TlsOpts),
-    Name = list_to_atom(Host ++ ":" ++ integer_to_list(Port)),
+    Name = binary_to_atom(<<Host/binary, ":", (integer_to_binary(Port))/binary>>, utf8),
     bloom:init(Name, PoolOpts, ConnectionOpts).
 
 get_port(UriMap) ->
     Port = case maps:get(scheme, UriMap) of
-        "http" -> 80;
-        "https" -> 443
+        <<"http">> -> 80;
+        <<"https">> -> 443
     end,
     maps:get(port, UriMap, Port).
 
-get_tls_opts(#{scheme := "http"}) ->
+get_tls_opts(#{scheme := <<"http">>}) ->
     #{};
-get_tls_opts(#{scheme := "https"}) ->
+get_tls_opts(#{scheme := <<"https">>}) ->
     #{tls_opts => [{verify, verify_none}]}.
