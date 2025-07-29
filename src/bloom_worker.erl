@@ -29,7 +29,7 @@ start_link(Opts, Id, ServiceName, Type) ->
 
 request(Uri, Method, Headers, Body, Opts) ->
     UriMap = uri_string:parse(Uri),
-    #{path := Path} = UriMap,
+    Path = get_request_path(UriMap, Method),
     ServiceName = make_service_name(UriMap),
     Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
     case bloom_pool_manager:lockout2(UriMap) of
@@ -220,3 +220,14 @@ make_service_name(#{scheme := Schema, host := Host} = UriMap) ->
     end,
     FinalPort = maps:get(port, UriMap, Port),
     binary_to_atom(<<Host/binary, ":", (integer_to_binary(FinalPort))/binary>>, utf8).
+
+get_request_path(UriMap, Method) ->
+    #{path := Path} = UriMap,
+    ListsOfMethods = [get, delete, head, options],
+    case lists:member(Method, ListsOfMethods) of
+        true ->
+            Query = maps:get(query, UriMap, <<>>),
+            <<Path/binary, Query/binary>>;
+        false ->
+            Path
+    end.
