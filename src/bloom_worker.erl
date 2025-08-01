@@ -227,7 +227,7 @@ get_request_path(UriMap, Method) ->
     case lists:member(Method, ListsOfMethods) of
         true ->
             Query = maps:get(query, UriMap, <<>>),
-            <<Path/binary, Query/binary>>;
+            <<Path/binary, "?", Query/binary>>;
         false ->
             Path
     end.
