@@ -141,7 +141,7 @@ handle_cast({initial, Id, WorkerPid}, State) ->
     Main = lookup(main),
     Extra = lookup(extra),
     Init = lookup(init),
-    RestBusy = lists:keydelete(Id, 2, Busy),
+    RestBusy = lists:keydelete(Id, 1, Busy),
     RestMain = lists:keydelete(Id, 1, Main),
     RestExtra = lists:keydelete(Id, 1, Extra),
     ok = insert(busy, RestBusy),
