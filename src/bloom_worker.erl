@@ -29,13 +29,14 @@ start_link(Opts, Id, ServiceName, Type) ->
 
 request(Uri, Method, Headers, Body, Opts) ->
     UriMap = uri_string:parse(Uri),
-    Path = get_request_path(UriMap, Method),
+    Path = get_request_path(UriMap),
     ServiceName = make_service_name(UriMap),
-    Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
-    case bloom_pool_manager:lockout2(UriMap) of
+    ConnOpts = maps:get(connection_opts, Opts, #{}),
+    case bloom_pool_manager:lockout2(UriMap, ConnOpts) of
         {ok, Id, Connection} ->
             call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts);
         {error, no_free_connections} ->
+            Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
             receive
                 {ok, Id, Connection} ->
                     call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts)
@@ -221,12 +222,11 @@ make_service_name(#{scheme := Schema, host := Host} = UriMap) ->
     FinalPort = maps:get(port, UriMap, Port),
     binary_to_atom(<<Host/binary, ":", (integer_to_binary(FinalPort))/binary>>, utf8).
 
-get_request_path(UriMap, Method) ->
+get_request_path(UriMap) ->
     #{path := Path} = UriMap,
-    ListsOfMethods = [get, delete, head, options],
-    case lists:member(Method, ListsOfMethods) of
+    case maps:is_key(query, UriMap) of
         true ->
-            Query = maps:get(query, UriMap, <<>>),
+            Query = maps:get(query, UriMap),
             <<Path/binary, "?", Query/binary>>;
         false ->
             Path

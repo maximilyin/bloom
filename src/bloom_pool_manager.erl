@@ -7,7 +7,7 @@
 %% ------------------------------------------------------------------
 
 -export([start_link/2]).
--export([lockin/2, lockout/1, lockout2/1]).
+-export([lockin/2, lockout/1, lockout2/2]).
 -export([add/4, initial/3]).
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
@@ -31,13 +31,13 @@ start_link(Name, Opts) ->
     PoolName = make_pool_name(Name),
     gen_server:start_link({local, PoolName}, ?MODULE, [Name, Opts], []).
 
-lockout2(#{host := Host} = UriMap) ->
+lockout2(#{host := Host} = UriMap, ConnectionOpts) ->
     Port = get_port(UriMap),
     Name = <<Host/binary,":", (integer_to_binary(Port))/binary>>,
     PoolName = make_pool_name(Name),
     case is_pool_exists(PoolName) of
         true -> ok;
-        false -> create_pool(UriMap)
+        false -> create_pool(UriMap, ConnectionOpts)
     end,
     gen_server:call(PoolName, {lockout, self()}, infinity).
 
@@ -264,14 +264,14 @@ make_pool_name(Name) when is_binary(Name) ->
     CompaundName = <<"bloom_", Name/binary, "_pool_manager">>,
     binary_to_atom(CompaundName, utf8).
 
-create_pool(#{host := Host} = UriMap) ->
+create_pool(#{host := Host} = UriMap, ConnOpts) ->
     Port = get_port(UriMap),
     TlsOpts = get_tls_opts(UriMap),
     PoolOpts = #{
         pool_size => 1,
         pool_max_size => 5
     },
-    Opts = #{
+    Opts = ConnOpts#{
         host => binary_to_list(Host),
         port => Port,
         http_opts => #{keepalive => 10000}
