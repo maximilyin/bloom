@@ -18,7 +18,7 @@
 -record(state, {id, connection, service_name, type, opts}).
 
 -define(RECONNECT_ATTEMPT, 3).
--define(REQ_TIMEOUT, 10000).
+-define(REQ_TIMEOUT, 60000).
 -define(RECONECT_TIMEOUT, 5000).
 
 %% ------------------------------------------------------------------
