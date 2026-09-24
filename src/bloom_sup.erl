@@ -21,9 +21,12 @@ start_pool(Name, PoolOpts, ConnectOpts) ->
     case supervisor:start_child(?MODULE, Spec) of
         {ok, _} ->
             ok;
+        {ok, _, _} ->
+            ok;
         {error, Reason} ->
             Args = [Name, Reason],
-            logger:error("Create service pool: ~p; reason: ~p", Args)
+            ok = logger:error("Create service pool: ~p; reason: ~p", Args),
+            {error, Reason}
     end.
 
 stop_pool(Name) ->

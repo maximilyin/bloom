@@ -1,6 +1,7 @@
 -module(http_echo_server).
 
 -export([start/0, stop/1, port/1]).
+-export([refuse_new/1]).
 
 start() ->
 	{ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}, {backlog, 128}]),
@@ -12,18 +13,40 @@ stop(Pid) ->
 	exit(Pid, shutdown),
 	ok.
 
+refuse_new(Pid) ->
+	Pid ! {refuse_new, self()},
+	receive
+		{refused, Pid} -> ok
+	after 5000 ->
+		error(refuse_new_timeout)
+	end.
+
 port(LSock) when is_port(LSock) ->
 	{ok, Port} = inet:port(LSock),
 	Port.
 
 acceptor_loop(LSock) ->
 	process_flag(trap_exit, true),
-	case gen_tcp:accept(LSock) of
-		{ok, Sock} ->
-			spawn_link(fun() -> handle_conn(Sock) end),
-			acceptor_loop(LSock);
-		Error ->
-			Error
+	receive
+		{refuse_new, From} ->
+			gen_tcp:close(LSock),
+			From ! {refused, self()},
+			refuse_loop()
+	after 0 ->
+		case gen_tcp:accept(LSock, 200) of
+			{ok, Sock} ->
+				spawn(fun() -> handle_conn(Sock) end),
+				acceptor_loop(LSock);
+			{error, timeout} ->
+				acceptor_loop(LSock);
+			Error ->
+				Error
+		end
+	end.
+
+refuse_loop() ->
+	receive
+		_ -> refuse_loop()
 	end.
 
 handle_conn(Sock) ->

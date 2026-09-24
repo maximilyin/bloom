@@ -4,6 +4,7 @@
 -export([start_link/2]).
 -export([init/1]).
 -export([start_child/3]).
+-export([terminate_all/1]).
 
 start_link(Name, ConnectOpts) ->
     SupName = make_sup_name(Name),
@@ -12,6 +13,16 @@ start_link(Name, ConnectOpts) ->
 start_child(Id, Name, Type) ->
     SupName = make_sup_name(Name),
     supervisor:start_child(SupName, [Id, Name, Type]).
+
+terminate_all(Name) ->
+    SupName = make_sup_name(Name),
+    lists:foreach(fun
+        ({_Id, Pid, _Type, _Mods}) when is_pid(Pid) ->
+            _ = supervisor:terminate_child(SupName, Pid);
+        (_) ->
+            ok
+    end, supervisor:which_children(SupName)),
+    ok.
 
 init([Name, ConnectOpts]) ->
     SupFlags = #{

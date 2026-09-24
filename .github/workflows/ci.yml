@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  ERLANG_IMAGE: erlang:28
+
+jobs:
+  compile:
+    name: Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: erlang:28
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git make gcc libc6-dev
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bloom-build
+          include-hidden-files: true
+          path: |
+            deps
+            ebin
+            .erlang.mk
+            bloom.d
+
+  xref:
+    name: Xref
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: compile
+    container:
+      image: erlang:28
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git make gcc libc6-dev
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bloom-build
+      - name: Run xref
+        run: make xref
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: xref
+    container:
+      image: erlang:28
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git make gcc libc6-dev
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bloom-build
+      - name: Run Dialyzer
+        run: make dialyze
+
+  ct:
+    name: Common tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: dialyzer
+    container:
+      image: erlang:28
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git make gcc libc6-dev
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bloom-build
+      - name: Run Common Test
+        run: make ct

@@ -44,7 +44,8 @@ when
     ConnectOpts :: connection_opts().
 init(Name, PoolOpts, ConnectOpts) ->
     ok = bloom_stats:add(Name),
-    bloom_sup:start_pool(Name, PoolOpts, ConnectOpts).
+    _ = bloom_sup:start_pool(Name, PoolOpts, ConnectOpts),
+    ok.
 
 -spec delete(Name) -> ok
 when

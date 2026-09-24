@@ -12,7 +12,7 @@ start_link(Name, PoolOpts, ConnectOpts) ->
 
 init([Name, PoolOpts, ConnectOpts]) ->
     SupFlags = #{
-        strategy    => one_for_one,
+        strategy    => one_for_all,
         intensity   => 1000,
         period      => 1
     },

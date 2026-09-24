@@ -32,39 +32,56 @@ request(Uri, Method, Headers, Body, Opts) ->
     Path = get_request_path(UriMap),
     ServiceName = make_service_name(UriMap),
     ConnOpts = maps:get(connection_opts, Opts, #{}),
-    case bloom_pool_manager:lockout2(UriMap, ConnOpts) of
+    Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
+    Start = erlang:monotonic_time(millisecond),
+    case bloom_pool_manager:lockout2(UriMap, ConnOpts, Timeout) of
         {ok, Id, Connection} ->
             call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts);
-        {error, no_free_connections} ->
-            Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
-            receive
-                {ok, Id, Connection} ->
-                    call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts)
-            after Timeout ->
-                ok = bloom_stats:update_counter(ServiceName, req_total),
-                ok = bloom_stats:update_counter(ServiceName, req_failed),
-                {error, timeout_no_free_connections}
-            end;
+        {error, no_free_connections, WaitRef} ->
+            Remain = remaining_timeout(Start, Timeout),
+            wait_for_conn(ServiceName, WaitRef, Remain, Method, Path, Headers, Body, Opts);
         {error, Reason} ->
             {error, Reason}
     end.
 
 req(ServiceName, Method, Path, Headers, Body, Opts) ->
     Timeout = maps:get(timeout, Opts, ?REQ_TIMEOUT),
-    case bloom_pool_manager:lockout(ServiceName) of
+    Start = erlang:monotonic_time(millisecond),
+    case bloom_pool_manager:lockout(ServiceName, Timeout) of
         {ok, Id, Connection} ->
             call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts);
-        {error, no_free_connections} ->
-            receive
-                {ok, Id, Connection} ->
-                    call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts)
-            after Timeout ->
-                ok = bloom_stats:update_counter(ServiceName, req_total),
-                ok = bloom_stats:update_counter(ServiceName, req_failed),
-                {error, timeout_no_free_connections}
-            end;
+        {error, no_free_connections, WaitRef} ->
+            Remain = remaining_timeout(Start, Timeout),
+            wait_for_conn(ServiceName, WaitRef, Remain, Method, Path, Headers, Body, Opts);
         {error, Reason} ->
             {error, Reason}
+    end.
+
+wait_for_conn(ServiceName, WaitRef, Timeout, Method, Path, Headers, Body, Opts) ->
+    receive
+        {bloom_conn, WaitRef, Id, Connection} ->
+            call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts)
+    after Timeout ->
+        _ = bloom_pool_manager:cancel_wait(ServiceName, WaitRef),
+        ok = return_late_conn(WaitRef),
+        ok = bloom_stats:update_counter(ServiceName, req_total),
+        ok = bloom_stats:update_counter(ServiceName, req_failed),
+        {error, timeout_no_free_connections}
+    end.
+
+return_late_conn(WaitRef) ->
+    receive
+        {bloom_conn, WaitRef, _Id, _Connection} ->
+            ok
+    after 0 ->
+        ok
+    end.
+
+remaining_timeout(Start, Timeout) ->
+    Elapsed = erlang:monotonic_time(millisecond) - Start,
+    case Timeout - Elapsed of
+        Remain when Remain > 0 -> Remain;
+        _ -> 0
     end.
 
 call(ServiceName, Id, Connection, Method, Path, Headers, Body, Opts) ->
@@ -108,16 +125,8 @@ stop(WorkerPid, Connection) ->
 %% gen_server Function Definitions
 %% ------------------------------------------------------------------
 init([Id, Name, Type, Opts]) ->
-    State = case connect(Opts) of
-        {ok, Pid} ->
-            _Ref = erlang:monitor(process, Pid),
-            ok = bloom_pool_manager:add(Id, Pid, Name, Type),
-            #state{connection = Pid};
-        {error, _Reason} ->
-            {ok, _} = timer:send_after(?RECONECT_TIMEOUT, reconnect),
-            #state{connection = init}
-    end,
-    {ok, State#state{id = Id, service_name = Name, type = Type, opts = Opts}}.
+    self() ! connect,
+    {ok, #state{id = Id, connection = init, service_name = Name, type = Type, opts = Opts}}.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -127,36 +136,19 @@ handle_cast(stop_worker, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(reconnect, #state{id = Id, type = Type, opts = Opts} = State) ->
-    NewState = case connect(Opts) of
-        {ok, NewConnection} ->
-            _Ref = erlang:monitor(process, NewConnection),
-            Name = State#state.service_name,
-            ok = bloom_pool_manager:add(Id, NewConnection, Name, Type),
-            State#state{connection = NewConnection};
-        {error, _Reason} ->
-            {ok, _} = timer:send_after(?RECONECT_TIMEOUT, reconnect),
-            State#state{connection = fail}
-    end,
-    {noreply, NewState};
-handle_info({'DOWN', Ref, process, Pid, R}, #state{id = Id, opts = Opts} = State) ->
+handle_info(connect, State) ->
+    {noreply, do_connect(State)};
+handle_info(reconnect, State) ->
+    {noreply, do_connect(State)};
+handle_info({'DOWN', Ref, process, Pid, R}, #state{id = Id} = State) ->
     ok = logger:warning("Connection is down: ~p; reason: ~p~n", [Pid, R]),
     Name = State#state.service_name,
     ok = bloom_pool_manager:initial(Id, self(), Name),
     ok = bloom_stats:update_counter(Name, conn_broken),
-    true = erlang:demonitor(Ref),
+    _ = erlang:demonitor(Ref, [flush]),
     ok = close_connection(Pid),
-    NewState = case connect(Opts) of
-        {ok, NewConnection} ->
-            _Ref = erlang:monitor(process, NewConnection),
-            Type = State#state.type,
-            ok = bloom_pool_manager:add(Id, NewConnection, Name, Type),
-            State#state{connection = NewConnection};
-        {error, _Reason} ->
-            {ok, _} = timer:send_after(?RECONECT_TIMEOUT, reconnect),
-            State#state{connection = fail}
-    end,
-	{noreply, NewState};
+    self() ! connect,
+    {noreply, State#state{connection = init}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -169,6 +161,20 @@ code_change(_OldVsn, State, _Extra) ->
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
+do_connect(#state{connection = Pid} = State) when is_pid(Pid) ->
+    State;
+do_connect(#state{id = Id, type = Type, opts = Opts} = State) ->
+    case connect(Opts) of
+        {ok, NewConnection} ->
+            _Ref = erlang:monitor(process, NewConnection),
+            Name = State#state.service_name,
+            ok = bloom_pool_manager:add(Id, NewConnection, Name, Type),
+            State#state{connection = NewConnection};
+        {error, _Reason} ->
+            {ok, _} = timer:send_after(?RECONECT_TIMEOUT, reconnect),
+            State#state{connection = fail}
+    end.
+
 connect(Opts) ->
     {Host, Opts2} = maps:take(host, Opts),
     {Port, Opts3} = maps:take(port, Opts2),
@@ -181,8 +187,6 @@ connect(Opts) ->
         connect_timeout => ConnectTimeout
     },
     case gun:open(Host, Port, ConnectionOpts) of
-        {ok, undefined} ->
-            {error, ignored};
         {ok, Pid} ->
             case gun:await_up(Pid, 5000) of
                 {ok, _Protocol} ->

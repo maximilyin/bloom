@@ -1,0 +1,23 @@
+.eunit
+*.o
+ebin
+*.plt
+.agent
+.cursor
+.erlang.mk
+bloom.d
+test/*.beam
+erl_crash.dump
+.concrete/DEV_MODE
+logs
+
+# rebar 2.x
+.rebar
+rel/example_project
+ebin/*.beam
+deps
+
+# rebar 3
+.rebar3
+_build/
+_checkouts/

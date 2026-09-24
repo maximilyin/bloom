@@ -7,8 +7,9 @@
 %% ------------------------------------------------------------------
 
 -export([start_link/2]).
--export([lockin/2, lockout/1, lockout2/2]).
+-export([lockin/2, lockout/2, lockout2/3, cancel_wait/2]).
 -export([add/4, initial/3]).
+-export([pool_counts/1]).
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
 %% ------------------------------------------------------------------
@@ -19,7 +20,20 @@
 -record(state, {
     name,
     pool_size,
-    pool_max_size
+    pool_max_size,
+    main = #{},
+    extra = #{},
+    busy = #{},
+    busy_mons = #{},
+    busy_waitrefs = #{},
+    init = #{},
+    worker_by_id = #{},
+    worker_mons = #{},
+    waiting,
+    waiters = #{},
+    waiter_mons = #{},
+    cancelled = #{},
+    total_waiting = 0
 }).
 
 -define(SEND_INFO_TIME,     5000).   %% 5 seconds
@@ -31,156 +45,185 @@ start_link(Name, Opts) ->
     PoolName = make_pool_name(Name),
     gen_server:start_link({local, PoolName}, ?MODULE, [Name, Opts], []).
 
-lockout2(#{host := Host} = UriMap, ConnectionOpts) ->
+lockout2(#{host := Host} = UriMap, ConnectionOpts, Timeout) ->
     Port = get_port(UriMap),
     Name = <<Host/binary,":", (integer_to_binary(Port))/binary>>,
     PoolName = make_pool_name(Name),
-    case is_pool_exists(PoolName) of
-        true -> ok;
-        false -> create_pool(UriMap, ConnectionOpts)
+    case whereis(PoolName) of
+        undefined -> create_pool(UriMap, ConnectionOpts);
+        _Pid -> ok
     end,
-    gen_server:call(PoolName, {lockout, self()}, infinity).
+    lockout_call(PoolName, Name, Timeout).
 
 lockin(Name, Id) ->
     PoolName = make_pool_name(Name),
-    ok = gen_server:cast(PoolName, {lockin, Id}).
+    case whereis(PoolName) of
+        undefined -> ok;
+        Pid -> gen_server:cast(Pid, {lockin, Id})
+    end,
+    ok.
 
-lockout(Name) ->
+lockout(Name, Timeout) ->
     PoolName = make_pool_name(Name),
-    case is_pool_exists(PoolName) of
-        false ->
-            {error, service_not_exists};
-        true ->
-            gen_server:call(PoolName, {lockout, self()}, infinity)
+    lockout_call(PoolName, Name, Timeout).
+
+cancel_wait(Name, WaitRef) ->
+    PoolName = make_pool_name(Name),
+    case whereis(PoolName) of
+        undefined ->
+            ok;
+        _Pid ->
+            case manager_call(PoolName, {cancel_wait, WaitRef}, 5000) of
+                {ok, _} -> ok;
+                {error, _} -> ok
+            end
+    end.
+
+pool_counts(Name) ->
+    PoolName = make_pool_name(Name),
+    case whereis(PoolName) of
+        undefined ->
+            #{busy => 0, waiters => 0, connected => 0, init => 0};
+        _Pid ->
+            case manager_call(PoolName, pool_counts, 5000) of
+                {ok, Counts} -> Counts;
+                {error, _} -> #{busy => 0, waiters => 0, connected => 0, init => 0}
+            end
     end.
 
 add(Id, Connection, Name, Type) ->
     PoolName = make_pool_name(Name),
-    ok = gen_server:cast(PoolName, {add, Id, Connection, Type}).
+    case whereis(PoolName) of
+        undefined -> ok;
+        Pid -> gen_server:cast(Pid, {add, Id, Connection, Type, self()})
+    end,
+    ok.
 
 initial(Id, WorkerPid, Name) ->
     PoolName = make_pool_name(Name),
-    ok = gen_server:cast(PoolName, {initial, Id, WorkerPid}).
+    case whereis(PoolName) of
+        undefined -> ok;
+        Pid -> gen_server:cast(Pid, {initial, Id, WorkerPid})
+    end,
+    ok.
 
 %% ------------------------------------------------------------------
 %% gen_server Function Definitions
 %% ------------------------------------------------------------------
 init([Name, Opts]) ->
-    ok = insert(main, []),
-    ok = insert(extra, []),
-    ok = insert(busy, []),
-    ok = insert(waiting, []),
-    ok = insert(total_waiting, 0),
+    ok = bloom_pool_worker_sup:terminate_all(Name),
     PoolSize = maps:get(pool_size, Opts),
-    State = #state{
+    State0 = #state{
         name = Name,
         pool_size = PoolSize,
-        pool_max_size = maps:get(pool_max_size, Opts)
+        pool_max_size = maps:get(pool_max_size, Opts),
+        waiting = queue:new()
     },
-    InitWorkers = [begin
+    State1 = lists:foldl(fun(_, Acc) ->
         Id = erlang:unique_integer([positive, monotonic]),
         {ok, WorkerPid} = bloom_pool_worker_sup:start_child(Id, Name, main),
-        {Id, WorkerPid}
-    end || _ <- lists:seq(1, PoolSize)],
-    ok = insert(init, InitWorkers),
+        track_new_worker(Id, WorkerPid, main, Acc)
+    end, State0, lists:seq(1, PoolSize)),
     {ok, _} = timer:send_after(0, send_pool_info),
     {ok, _} = timer:send_after(?TTL_EXTRA_WORKERS, clear_extra_workers),
-    {ok, State}.
+    {ok, State1}.
 
-handle_call({lockout, ReqPid}, From, State) ->
-    Busy = lookup(busy),
-    case lookup(main) of
-        [] ->
-            case lookup(extra) of
-                [] ->
-                    _ = gen_server:reply(From, {error, no_free_connections}),
-                    ok = create_extra_worker(State),
-                    Waiting = lookup(waiting),
-                    TotalWaiting = lookup(total_waiting),
-                    ok = insert(waiting, Waiting ++ [ReqPid]),
-                    ok = insert(total_waiting, TotalWaiting+1);
-                [{Id, Connection, WorkerPid, _LTU}|RestConnections] ->
-                    _ = gen_server:reply(From, {ok, Id, Connection}),
-                    Monitor = erlang:monitor(process, ReqPid),
-                    ok = insert(extra, RestConnections),
-                    ok = insert(busy, [{Id, ReqPid, Connection, WorkerPid, Monitor, extra}|Busy])
-            end;
-        [{Id, Connection, WorkerPid, _LTU}|RestConnections] ->
-            _ = gen_server:reply(From, {ok, Id, Connection}),
-            Monitor = erlang:monitor(process, ReqPid),
-            ok = insert(main, RestConnections),
-            ok = insert(busy, [{Id, ReqPid, Connection, WorkerPid, Monitor, main}|Busy])
-    end,
-    {noreply, State};
+handle_call({lockout, ReqPid, WaitRef}, _From, State) ->
+    case maps:take(WaitRef, State#state.cancelled) of
+        {_, RestCancelled} ->
+            {reply, {error, no_free_connections}, State#state{cancelled = RestCancelled}};
+        error ->
+            case take_free(State) of
+                {Id, Connection, WorkerPid, Type, State1} ->
+                    State2 = checkout_to_req(Id, Connection, WorkerPid, Type, ReqPid, WaitRef, State1),
+                    {reply, {ok, Id, Connection}, State2};
+                empty ->
+                    State1 = enqueue_waiter(WaitRef, ReqPid, State),
+                    ok = request_scale_up(),
+                    {reply, {error, no_free_connections}, State1}
+            end
+    end;
+handle_call({cancel_wait, WaitRef}, _From, State) ->
+    {reply, ok, cancel_waiter(WaitRef, State)};
+handle_call(pool_counts, _From, State) ->
+    Counts = #{
+        busy => map_size(State#state.busy),
+        waiters => maps:size(State#state.waiters),
+        connected => map_size(State#state.main) + map_size(State#state.extra) + map_size(State#state.busy),
+        init => map_size(State#state.init)
+    },
+    {reply, Counts, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
 handle_cast({lockin, Id}, State) ->
-    Busy = lookup(busy),
-    case lists:keytake(Id, 1, Busy) of
-        {value, {Id, _ReqPid, Connection, WorkerPid, Monitor, Type}, RestBusy} ->
-            true = erlang:demonitor(Monitor),
-            ok = give_waiting_req(Id, Connection, RestBusy, Type, WorkerPid);
+    {noreply, lockin_id(Id, State)};
+handle_cast({add, Id, Connection, Type, WorkerPid}, State) ->
+    case accept_add(Id, WorkerPid, State) of
         false ->
-            ok = logger:warning("Busy connection_id not found: ~p", [Id])
-    end,
-    {noreply, State};
-handle_cast({add, Id, Connection, Type}, State) ->
-    Init = lookup(init),
-    case lists:keytake(Id, 1, Init) of
-        {_, {Id, WorkerPid}, RestInit} ->
-            Busy = lookup(busy),
-            ok = give_waiting_req(Id, Connection, Busy, Type, WorkerPid),
-            ok = insert(init, RestInit);
-        false ->
-            ok = logger:warning("Init connection: ~p not found", [Id])
-    end,
-    {noreply, State};
+            {noreply, State};
+        true ->
+            State1 = drop_id(Id, State),
+            State2 = retarget_worker(Id, WorkerPid, Type, State1),
+            Init = maps:remove(Id, State2#state.init),
+            State3 = give_waiting_req(Id, Connection, Type, WorkerPid,
+                State2#state{init = Init}),
+            {noreply, State3}
+    end;
 handle_cast({initial, Id, WorkerPid}, State) ->
-    Busy = lookup(busy),
-    Main = lookup(main),
-    Extra = lookup(extra),
-    Init = lookup(init),
-    RestBusy = lists:keydelete(Id, 1, Busy),
-    RestMain = lists:keydelete(Id, 1, Main),
-    RestExtra = lists:keydelete(Id, 1, Extra),
-    ok = insert(busy, RestBusy),
-    ok = insert(main, RestMain),
-    ok = insert(extra, RestExtra),
-    ok = insert(init, [{Id, WorkerPid}|Init]),
-    {noreply, State};
+    State1 = drop_id(Id, State),
+    {noreply, State1#state{init = maps:put(Id, WorkerPid, State1#state.init)}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(send_pool_info, #state{name = Name} = State) ->
     Info = #{
-        ready => length(lookup(main))+length(lookup(extra)),
-        busy => length(lookup(busy)),
-        init => length(lookup(init)),
-        now_waiting => length(lookup(waiting)),
-        total_waiting => lookup(total_waiting),
-        connected => length(lookup(main))+length(lookup(extra))+length(lookup(busy)),
+        ready => map_size(State#state.main) + map_size(State#state.extra),
+        busy => map_size(State#state.busy),
+        init => map_size(State#state.init),
+        now_waiting => maps:size(State#state.waiters),
+        total_waiting => State#state.total_waiting,
+        connected => map_size(State#state.main) + map_size(State#state.extra) + map_size(State#state.busy),
         pool_size => State#state.pool_size,
         pool_max_size => State#state.pool_max_size
     },
     ok = bloom_stats:update(Name, conn_info, Info),
     {ok, _} = timer:send_after(?SEND_INFO_TIME, send_pool_info),
     {noreply, State};
-handle_info(clear_extra_workers, #state{name = Name} = State) ->
-    Extra = lookup(extra),
-    ok = clear_workers(Extra, Name, []),
+handle_info(clear_extra_workers, State) ->
+    State1 = expire_extra_workers(State),
     {ok, _} = timer:send_after(?TTL_EXTRA_WORKERS, clear_extra_workers),
-    {noreply, State};
-handle_info({'DOWN', Monitor, process, ReqPid, _}, State) ->
-    true = erlang:demonitor(Monitor),
-    Busy = lookup(busy),
-    case lists:keytake(ReqPid, 2, Busy) of
-        {value, {Id, ReqPid, Connection, WorkerPid, _, Type}, RestBusy} ->
-            ok = give_waiting_req(Id, Connection, RestBusy, Type, WorkerPid);
+    {noreply, State1};
+handle_info(scale_up, #state{name = Name, pool_max_size = Max} = State) ->
+    NewState = case connected_and_init(State) < Max of
+        true ->
+            Id = erlang:unique_integer([positive, monotonic]),
+            case bloom_pool_worker_sup:start_child(Id, Name, extra) of
+                {ok, WorkerPid} ->
+                    track_new_worker(Id, WorkerPid, extra, State);
+                {ok, WorkerPid, _Info} ->
+                    track_new_worker(Id, WorkerPid, extra, State);
+                {error, Reason} ->
+                    ok = logger:error("Start extra worker failed for ~p; reason: ~p",
+                        [Name, Reason]),
+                    State
+            end;
         false ->
-            ok
+            State
     end,
-    {noreply, State};
+    {noreply, NewState};
+handle_info({'DOWN', Mon, process, _Pid, Reason}, State) ->
+    case maps:take(Mon, State#state.worker_mons) of
+        {Id, WorkerMons} ->
+            {noreply, worker_down(Id, Reason, State#state{worker_mons = WorkerMons})};
+        error ->
+            case maps:take(Mon, State#state.waiter_mons) of
+                {WaitRef, WaiterMons} ->
+                    {noreply, waiter_down(WaitRef, State#state{waiter_mons = WaiterMons})};
+                error ->
+                    {noreply, req_down(Mon, State)}
+            end
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -193,69 +236,260 @@ code_change(_OldVsn, State, _Extra) ->
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
-lookup(Type) ->
-    get(Type).
+lockout_call(PoolName, Name, Timeout) ->
+    case whereis(PoolName) of
+        undefined ->
+            {error, service_not_exists};
+        _Pid ->
+            WaitRef = make_ref(),
+            case manager_call(PoolName, {lockout, self(), WaitRef}, Timeout) of
+                {ok, {ok, Id, Connection}} ->
+                    {ok, Id, Connection};
+                {ok, {error, no_free_connections}} ->
+                    {error, no_free_connections, WaitRef};
+                {error, timeout} ->
+                    _ = cancel_wait(Name, WaitRef),
+                    ok = discard_late_conn(WaitRef),
+                    {error, timeout_no_free_connections};
+                {error, noproc} ->
+                    {error, service_not_exists}
+            end
+    end.
 
-insert(Type, List) ->
-    put(Type, List),
+manager_call(PoolName, Request, Timeout) ->
+    try
+        {ok, gen_server:call(PoolName, Request, Timeout)}
+    catch
+        exit:{timeout, {gen_server, call, _}} ->
+            {error, timeout};
+        exit:{noproc, {gen_server, call, _}} ->
+            {error, noproc};
+        exit:{normal, {gen_server, call, _}} ->
+            {error, noproc};
+        exit:{shutdown, {gen_server, call, _}} ->
+            {error, noproc};
+        exit:{{noproc, _}, {gen_server, call, _}} ->
+            {error, noproc};
+        exit:{{shutdown, _}, {gen_server, call, _}} ->
+            {error, noproc}
+    end.
+
+take_free(#state{main = Main, extra = Extra} = State) ->
+    case take_any(Main) of
+        {Id, {Connection, WorkerPid, _LTU}, RestMain} ->
+            {Id, Connection, WorkerPid, main, State#state{main = RestMain}};
+        empty ->
+            case take_any(Extra) of
+                {Id, {Connection, WorkerPid, _LTU}, RestExtra} ->
+                    {Id, Connection, WorkerPid, extra, State#state{extra = RestExtra}};
+                empty ->
+                    empty
+            end
+    end.
+
+take_any(Map) ->
+    case maps:next(maps:iterator(Map)) of
+        none ->
+            empty;
+        {Id, Value, _Iter} ->
+            {Id, Value, maps:remove(Id, Map)}
+    end.
+
+enqueue_waiter(WaitRef, Pid, #state{waiting = Q, waiters = Waiters,
+        waiter_mons = WaiterMons, total_waiting = Total} = State) ->
+    Mon = erlang:monitor(process, Pid),
+    State#state{
+        waiting = queue:in(WaitRef, Q),
+        waiters = Waiters#{WaitRef => {Pid, Mon}},
+        waiter_mons = WaiterMons#{Mon => WaitRef},
+        total_waiting = Total + 1
+    }.
+
+cancel_waiter(WaitRef, State) ->
+    case maps:take(WaitRef, State#state.waiters) of
+        {{_Pid, Mon}, RestWaiters} ->
+            erlang:demonitor(Mon, [flush]),
+            State#state{
+                waiters = RestWaiters,
+                waiter_mons = maps:remove(Mon, State#state.waiter_mons)
+            };
+        error ->
+            case maps:take(WaitRef, State#state.busy_waitrefs) of
+                {Id, RestRefs} ->
+                    reclaim_busy_id(Id, State#state{busy_waitrefs = RestRefs});
+                error ->
+                    State#state{cancelled = maps:put(WaitRef, true, State#state.cancelled)}
+            end
+    end.
+
+discard_late_conn(WaitRef) ->
+    receive
+        {bloom_conn, WaitRef, _Id, _Connection} ->
+            ok
+    after 0 ->
+        ok
+    end.
+
+accept_add(Id, WorkerPid, State) ->
+    is_process_alive(WorkerPid) andalso
+        (maps:is_key(Id, State#state.init) orelse maps:is_key(Id, State#state.worker_by_id)).
+
+request_scale_up() ->
+    self() ! scale_up,
     ok.
 
-clear_workers([], _ServiceName, UpdatedExtra) ->
-    ok = insert(extra, UpdatedExtra);
-clear_workers([{Id, Connection, WorkerPid, LTU}|Extra], ServiceName, Acc) ->
-    ExpiredTime = os:system_time(millisecond) - ?TTL_EXTRA_WORKERS,
-    case ExpiredTime > LTU of
-        true ->
-            ok = bloom_worker:stop(WorkerPid, Connection),
-            clear_workers(Extra, ServiceName, Acc);
-        false ->
-            NewAcc = [{Id, Connection, WorkerPid, LTU}|Acc],
-            clear_workers(Extra, ServiceName, NewAcc)
+track_new_worker(Id, WorkerPid, Type, State) ->
+    Mon = erlang:monitor(process, WorkerPid),
+    State#state{
+        init = maps:put(Id, WorkerPid, State#state.init),
+        worker_by_id = maps:put(Id, {WorkerPid, Mon, Type}, State#state.worker_by_id),
+        worker_mons = maps:put(Mon, Id, State#state.worker_mons)
+    }.
+
+retarget_worker(Id, WorkerPid, Type, #state{worker_by_id = ById, worker_mons = Mons} = State) ->
+    case maps:get(Id, ById, undefined) of
+        {WorkerPid, _Mon, _} ->
+            State;
+        {_OldPid, OldMon, _} ->
+            erlang:demonitor(OldMon, [flush]),
+            NewMon = erlang:monitor(process, WorkerPid),
+            State#state{
+                worker_by_id = maps:put(Id, {WorkerPid, NewMon, Type}, ById),
+                worker_mons = maps:put(NewMon, Id, maps:remove(OldMon, Mons))
+            };
+        undefined ->
+            NewMon = erlang:monitor(process, WorkerPid),
+            State#state{
+                worker_by_id = maps:put(Id, {WorkerPid, NewMon, Type}, ById),
+                worker_mons = maps:put(NewMon, Id, Mons)
+            }
     end.
 
-create_extra_worker(State) ->
-    Init = lookup(init),
-    Connected = length(lookup(main))+length(lookup(extra))+length(lookup(busy))+length(Init),
-    PoolMaxSize = State#state.pool_max_size,
-    case Connected < PoolMaxSize of
-        true ->
-            Name = State#state.name,
-            Id = erlang:unique_integer([positive, monotonic]),
-            {ok, WorkerPid} = bloom_pool_worker_sup:start_child(Id, Name, extra),
-            ok = insert(init, [{Id, WorkerPid}|Init]);
-        false ->
-            ok
-    end.
+checkout_to_req(Id, Connection, WorkerPid, Type, ReqPid, WaitRef, State) ->
+    ReqMon = erlang:monitor(process, ReqPid),
+    BusyItem = {ReqPid, Connection, WorkerPid, ReqMon, Type, WaitRef},
+    State#state{
+        busy = maps:put(Id, BusyItem, State#state.busy),
+        busy_mons = maps:put(ReqMon, Id, State#state.busy_mons),
+        busy_waitrefs = maps:put(WaitRef, Id, State#state.busy_waitrefs)
+    }.
 
-give_waiting_req(Id, Connection, Busy, Type, WorkerPid) ->
-    Waiting = lookup(waiting),
-    case get_alive_process(Waiting) of
-        {} ->
-            ok = insert(busy, Busy),
+give_waiting_req(Id, Connection, Type, WorkerPid, #state{waiting = Q} = State) ->
+    case queue:out(Q) of
+        {empty, _} ->
             LTU = os:system_time(millisecond),
-            Ready = lookup(Type),
-            ok = insert(Type, [{Id, Connection, WorkerPid, LTU}|Ready]);
-        {ReqPid, RestWaiting} ->
-            ReqPid ! {ok, Id, Connection},
-            Monitor = erlang:monitor(process, ReqPid),
-            ok = insert(waiting, RestWaiting),
-            ok = insert(busy, [{Id, ReqPid, Connection, WorkerPid, Monitor, Type}|Busy])
+            Conn = {Connection, WorkerPid, LTU},
+            case Type of
+                main ->
+                    State#state{main = maps:put(Id, Conn, State#state.main)};
+                extra ->
+                    State#state{extra = maps:put(Id, Conn, State#state.extra)}
+            end;
+        {{value, WaitRef}, RestQ} ->
+            State1 = State#state{waiting = RestQ},
+            case maps:take(WaitRef, State1#state.waiters) of
+                error ->
+                    give_waiting_req(Id, Connection, Type, WorkerPid, State1);
+                {{Pid, Mon}, RestWaiters} ->
+                    erlang:demonitor(Mon, [flush]),
+                    WaiterMons = maps:remove(Mon, State1#state.waiter_mons),
+                    Pid ! {bloom_conn, WaitRef, Id, Connection},
+                    checkout_to_req(Id, Connection, WorkerPid, Type, Pid, WaitRef,
+                        State1#state{waiters = RestWaiters, waiter_mons = WaiterMons})
+            end
     end.
 
-get_alive_process([]) ->
-    ok = insert(waiting, []),
-    {};
-get_alive_process([Pid|RestPids]) ->
-    case is_process_alive(Pid) of
-        true ->
-            {Pid, RestPids};
-        false ->
-            get_alive_process(RestPids)
+drop_id(Id, State) ->
+    Main = maps:remove(Id, State#state.main),
+    Extra = maps:remove(Id, State#state.extra),
+    case maps:take(Id, State#state.busy) of
+        {{_ReqPid, _Conn, _WPid, ReqMon, _Type, WaitRef}, RestBusy} ->
+            erlang:demonitor(ReqMon, [flush]),
+            BusyMons = maps:remove(ReqMon, State#state.busy_mons),
+            WaitRefs = maps:remove(WaitRef, State#state.busy_waitrefs),
+            State#state{
+                main = Main,
+                extra = Extra,
+                busy = RestBusy,
+                busy_mons = BusyMons,
+                busy_waitrefs = WaitRefs
+            };
+        error ->
+            State#state{main = Main, extra = Extra}
     end.
 
-is_pool_exists(PoolName) ->
-    RegisteredProcess = erlang:registered(),
-    lists:member(PoolName, RegisteredProcess).
+lockin_id(Id, State) ->
+    case maps:take(Id, State#state.busy) of
+        {{_ReqPid, Connection, WorkerPid, ReqMon, Type, WaitRef}, RestBusy} ->
+            erlang:demonitor(ReqMon, [flush]),
+            BusyMons = maps:remove(ReqMon, State#state.busy_mons),
+            WaitRefs = maps:remove(WaitRef, State#state.busy_waitrefs),
+            give_waiting_req(Id, Connection, Type, WorkerPid,
+                State#state{busy = RestBusy, busy_mons = BusyMons, busy_waitrefs = WaitRefs});
+        error ->
+            ok = logger:warning("Busy connection_id not found: ~p", [Id]),
+            State
+    end.
+
+reclaim_busy_id(Id, State) ->
+    case maps:take(Id, State#state.busy) of
+        {{_ReqPid, Connection, WorkerPid, ReqMon, Type, _WaitRef}, RestBusy} ->
+            erlang:demonitor(ReqMon, [flush]),
+            BusyMons = maps:remove(ReqMon, State#state.busy_mons),
+            give_waiting_req(Id, Connection, Type, WorkerPid,
+                State#state{busy = RestBusy, busy_mons = BusyMons});
+        error ->
+            State
+    end.
+
+worker_down(Id, Reason, State) ->
+    State1 = drop_id(Id, State),
+    ById = maps:remove(Id, State1#state.worker_by_id),
+    State2 = State1#state{worker_by_id = ById},
+    case Reason of
+        normal ->
+            State2#state{init = maps:remove(Id, State2#state.init)};
+        shutdown ->
+            State2#state{init = maps:remove(Id, State2#state.init)};
+        {shutdown, _} ->
+            State2#state{init = maps:remove(Id, State2#state.init)};
+        _ ->
+            State2#state{init = maps:put(Id, undefined, State2#state.init)}
+    end.
+
+waiter_down(WaitRef, State) ->
+    Waiters = maps:remove(WaitRef, State#state.waiters),
+    State#state{waiters = Waiters}.
+
+req_down(Mon, State) ->
+    case maps:take(Mon, State#state.busy_mons) of
+        {Id, BusyMons} ->
+            case maps:take(Id, State#state.busy) of
+                {{_ReqPid, Connection, WorkerPid, Mon, Type, WaitRef}, RestBusy} ->
+                    WaitRefs = maps:remove(WaitRef, State#state.busy_waitrefs),
+                    give_waiting_req(Id, Connection, Type, WorkerPid,
+                        State#state{busy = RestBusy, busy_mons = BusyMons, busy_waitrefs = WaitRefs});
+                error ->
+                    State#state{busy_mons = BusyMons}
+            end;
+        error ->
+            State
+    end.
+
+connected_and_init(#state{main = M, extra = E, busy = B, init = I}) ->
+    map_size(M) + map_size(E) + map_size(B) + map_size(I).
+
+expire_extra_workers(#state{extra = Extra} = State) ->
+    ExpiredTime = os:system_time(millisecond) - ?TTL_EXTRA_WORKERS,
+    maps:fold(fun(Id, {Connection, WorkerPid, LTU}, Acc) ->
+        case ExpiredTime > LTU of
+            true ->
+                ok = bloom_worker:stop(WorkerPid, Connection),
+                Acc#state{extra = maps:remove(Id, Acc#state.extra)};
+            false ->
+                Acc
+        end
+    end, State, Extra).
 
 make_pool_name(Name) when is_atom(Name) ->
     StringName = atom_to_binary(Name, utf8),

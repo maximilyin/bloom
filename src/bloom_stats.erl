@@ -27,7 +27,7 @@ init() ->
     ok.
 
 add(Name) ->
-    true = ets:insert(?MODULE, #stat{name = Name}),
+    _ = ets:insert_new(?MODULE, #stat{name = Name}),
     ok.
 
 delete(Name) ->
